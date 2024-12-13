@@ -731,14 +731,14 @@ class StreamingDataLoader(DataLoader):
 
 class SafeStreamingDataLoader(DataLoader):
     r"""The StreamingDataLoader combines a dataset and a sampler, and provides an iterable over the given dataset.
- 
+
     The :class:`~litdata.streaming.dataloader.StreamingDataLoader` supports either a
     StreamingDataset and CombinedStreamingDataset datasets with single- or multi-process loading,
     customizing
     loading order and optional automatic batching (collation) and memory pinning.
- 
+
     See :py:mod:`torch.utils.data` documentation page for more details.
- 
+
     Args:
         dataset (Dataset): dataset from which to load the data.
         batch_size (int, optional): how many samples per batch to load
@@ -778,11 +778,11 @@ class SafeStreamingDataLoader(DataLoader):
             ``True``.
         profile_batches (int, bool, optional): Whether to record data loading profile and generate a result.json file.
         profile_dir (int, bool,  optional): Where to store the recorded trace when profile_batches is enabled.
- 
+
     """
- 
+
     __doc__ = DataLoader.__doc__
- 
+
     def __init__(
         self,
         dataset: Union[StreamingDataset, CombinedStreamingDataset],
@@ -802,27 +802,27 @@ class SafeStreamingDataLoader(DataLoader):
                 "The provided dataset should be either an instance of StreamingDataset or CombinedStreamingDataset."
                 f" Found {dataset}."
             )
- 
+
         if shuffle is not None:
             dataset.set_shuffle(shuffle)
- 
+
         if drop_last is not None:
             dataset.set_drop_last(drop_last)
- 
+
         dataset.set_batch_size(batch_size)
         dataset.set_num_workers(num_workers)
- 
+
         shuffle = None
- 
+
         if profile_batches and not _VIZ_TRACKER_AVAILABLE:
             raise ModuleNotFoundError("To use profile_batches, viztracer is required. Run `pip install viztracer`")
- 
+
         if profile_batches and num_workers == 0:
             raise ValueError("Profiling is supported only with num_workers >= 1.")
- 
+
         if collate_fn:
             collate_fn = StreamingDataLoaderCollateFn(collate_fn)
- 
+
         self.current_epoch = 0
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -844,7 +844,7 @@ class SafeStreamingDataLoader(DataLoader):
             collate_fn=collate_fn,
             **kwargs,
         )  # type: ignore
- 
+
     def __iter__(self) -> Any:
         if not self.restore:
             self._latest_worker_idx = 0
@@ -853,60 +853,68 @@ class SafeStreamingDataLoader(DataLoader):
             self.current_epoch += 1
             self._num_samples_yielded_combined = {}
             self._num_samples_yielded_streaming = 0
-            self.dataset.reset_state_dict()
- 
-        self.dataset.set_epoch(self.current_epoch)
- 
+            self.dataset.reset_state_dict()  # type: ignore
+
+        self.dataset.set_epoch(self.current_epoch)  # type: ignore
+
         if isinstance(self.dataset, StreamingDataset):
             assert self.batch_size
+            iterator = super().__iter__()
+            i = 0
+            while True:
+                try:
+                    batch = next(iterator)
+                    self._latest_worker_idx = next(self._worker_idx_iter)  # type: ignore
+                    self._num_samples_yielded_streaming += self.batch_size
+                    i += 1
+                    yield batch
+                except StopIteration:
+                    break
+                except RuntimeError as e:
+                    print(f"Caught exception: {str(e).split('.')[0]}. Skipping problematic batch {i}/{len(self)}.")
+                    self._num_samples_yielded_streaming += self.batch_size
+                    continue
+
+        else:
+            self.dataset._set_use_streaming_dataloader(True)  # type: ignore
+            assert self.batch_size
+            # TODO: Inject a custom collate function to avoid collating the __NUM_SAMPLES_YIELDED__ key
+            i = 0
             iterator = super().__iter__()
             while True:
                 try:
                     batch = next(iterator)
-                    # print(i, len(self.dataset)//self.batch_size)
-                    self._latest_worker_idx = next(
-                        self._worker_idx_iter
-                    )  # type: ignore
-                    self._num_samples_yielded_streaming += self.batch_size
-                    yield batch
+                    self._latest_worker_idx = next(self._worker_idx_iter)  # type: ignore
+                    if isinstance(batch, dict) and __NUM_SAMPLES_YIELDED_KEY__ in batch:
+                        self._num_samples_yielded_combined[self._latest_worker_idx] = [
+                            sample[-1].item() if self.batch_size > 1 else sample.item()
+                            for sample in batch[__NUM_SAMPLES_YIELDED_KEY__]
+                        ]
+
+                        yield batch[__SAMPLES_KEY__]
+                    else:
+                        yield batch
+                    i += 1
                 except StopIteration:
                     break
-                except Exception as e:
-                    self._num_samples_yielded_streaming += self.batch_size
-                    current_batch = self._num_samples_yielded_streaming // self.batch_size
-                    print(
-                        f"Caught RuntimeError: {str(e).split('.')[0]}. "
-                        f"Skipping problematic batch {current_batch}/{len(self)}."
-                    )
+                except RuntimeError as e:
+                    print(f"Caught exception: {str(e).split('.')[0]}. Skipping problematic batch {i}/{len(self)}.")
                     continue
-        else:
-            self.dataset._set_use_streaming_dataloader(True)
-            assert self.batch_size
-            # TODO: Inject a custom collate function to avoid collating the __NUM_SAMPLES_YIELDED__ key
-            for batch in super().__iter__():
-                self._latest_worker_idx = next(self._worker_idx_iter)  # type: ignore
-                if isinstance(batch, dict) and __NUM_SAMPLES_YIELDED_KEY__ in batch:
-                    self._num_samples_yielded_combined[self._latest_worker_idx] = [
-                        sample[-1].item() if self.batch_size > 1 else sample.item()
-                        for sample in batch[__NUM_SAMPLES_YIELDED_KEY__]
-                    ]
- 
-                    yield batch[__SAMPLES_KEY__]
-                else:
-                    yield batch
- 
+
         self.restore = False
- 
+
     def __len__(self) -> int:
         if self._dataset_kind == _DatasetKind.Iterable:
-            length = self._IterableDataset_len_called = self.dataset.get_len(self.num_workers, self.batch_size)
+            length = self._IterableDataset_len_called = self.dataset.get_len(  # type: ignore
+                self.num_workers, self.batch_size
+            )
             if self.batch_size is not None:  # IterableDataset doesn't allow custom sampler or batch_sampler
                 from math import ceil
- 
+
                 return length // self.batch_size if self.drop_last else ceil(length / self.batch_size)
             return length
-        return len(self._index_sampler)
- 
+        return len(self._index_sampler)  # type: ignore
+
     def state_dict(self) -> Dict[str, Any]:
         if isinstance(self.dataset, StreamingDataset):
             assert self.batch_size
@@ -918,63 +926,65 @@ class SafeStreamingDataLoader(DataLoader):
                 "num_samples_yielded": self._num_samples_yielded_streaming,
                 "latest_worker_idx": self._latest_worker_idx,
             }
- 
+
         num_samples_yieled = [0 for _ in range(len(list(self._num_samples_yielded_combined.values())[0]))]
         for worker_idx in self._num_samples_yielded_combined:
             for dataset_idx, samples_yieled in enumerate(self._num_samples_yielded_combined[worker_idx]):
                 num_samples_yieled[dataset_idx] += samples_yieled
- 
+
         return {
-            "dataset": self.dataset.state_dict(self.num_workers, self.batch_size, num_samples_yieled),
+            "dataset": self.dataset.state_dict(  # type: ignore
+                self.num_workers, self.batch_size, num_samples_yieled
+            ),
             "current_epoch": self.current_epoch if self.restore else self.current_epoch - 1,
             "latest_worker_idx": self._latest_worker_idx,
             "num_samples_yielded": deepcopy(self._num_samples_yielded_combined),
         }
- 
+
     def load_state_dict(self, obj: Dict[str, Any]) -> None:
         """Load a dict containing training state (called from non-worker process).
- 
+
         This is called on each copy of the dataset when resuming.
- 
+
         Args:
             obj (Any): The state.
- 
+
         """
         self.current_epoch = obj["current_epoch"]
- 
+
         if isinstance(self.dataset, StreamingDataset):
             self._num_samples_yielded_streaming = obj["num_samples_yielded"]
         else:
             self._num_samples_yielded_combined = obj["num_samples_yielded"]
- 
+
         # Used to restart on the next DataLoader worker from the previous run.
         self._latest_worker_idx = obj["latest_worker_idx"] + 1
         self._worker_idx_iter = iter(self._worker_idx)
         for _ in range(self._latest_worker_idx):
             next(self._worker_idx_iter)
- 
+
         # Inform we are resuming and disable resetting the StreamingDataLoader state.
         # This is toggle back to False when the `__iter__` method of the StreamingDataLoader completes.
         # self.restore = True
- 
+
         if isinstance(self.dataset, CombinedStreamingDataset):
             self.dataset._set_use_streaming_dataloader(True)
             self.dataset.load_state_dict(obj)
- 
+
             # Inform that the dataloader is resuming.
             # TODO: Check if the number of samples yielded is less than the length of the dataset.
             # Also, len is not available for CombinedStreamingDataset in case of provided weights.
             self.restore = True
- 
+
         elif isinstance(self.dataset, StreamingDataset):
             self.dataset.load_state_dict(obj["dataset"])
- 
+
             # Inform that the dataloader is resuming.
             if self._num_samples_yielded_streaming < len(self.dataset):
                 self.restore = True
         else:
             raise RuntimeError("The provided dataset should be a `StreamingDataset` or a `CombinedStreamingDataset`.")
- 
+
     def _get_iterator(self) -> "_BaseDataLoaderIter":
         """Overridden to ensure the `Cache.done()` method is triggered on iteration done."""
         if self.num_workers == 0:
